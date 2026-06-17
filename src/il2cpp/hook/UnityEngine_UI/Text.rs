@@ -59,7 +59,7 @@ pub fn set_best_fit_downscale(this: *mut Il2CppObject) {
     set_best_fit(this, true);
 }
 
-pub static ACTIVE_TEXT_COMPONENTS: Lazy<Mutex<FnvHashMap<usize, String>>> = Lazy::new(|| {
+pub static ACTIVE_TEXT_COMPONENTS: Lazy<Mutex<FnvHashMap<usize, (u32, String)>>> = Lazy::new(|| {
     Mutex::new(FnvHashMap::default())
 });
 
@@ -76,38 +76,91 @@ pub extern "C" fn set_text_hook(this: *mut Il2CppObject, value: *mut Il2CppStrin
 
     let orig_str = unsafe { (*value).as_utf16str().to_string() };
 
-    ACTIVE_TEXT_COMPONENTS.lock().unwrap().insert(this as usize, orig_str.clone());
-
     if let Some(trans) = SugoiClient::instance().get_cached(&orig_str) {
         return get_orig_fn!(set_text_hook, SetTextFn)(this, trans.to_il2cpp_string());
     }
 
+    let active_id = crate::core::sugoi_client::ACTIVE_STORY_ID.load(std::sync::atomic::Ordering::Relaxed);
+    if let Some(story_pending) = crate::core::sugoi_client::PENDING_STORY_TRANSLATIONS.lock().unwrap().get(&active_id) {
+        if let Some(Some(trans)) = story_pending.get(&orig_str) {
+            return get_orig_fn!(set_text_hook, SetTextFn)(this, trans.to_il2cpp_string());
+        }
+    }
+
+    let gen = crate::core::sugoi_client::COMPONENT_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
+    ACTIVE_TEXT_COMPONENTS.lock().unwrap().insert(this as usize, (gen, orig_str));
+
     get_orig_fn!(set_text_hook, SetTextFn)(this, value);
 }
 
-pub fn apply_translations(completed: &[(String, String)]) {
-    let mut updates_to_apply = Vec::new();
+#[cfg(target_os = "windows")]
+fn is_object_alive_safe(obj: *mut Il2CppObject) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+
+    microseh::try_seh(|| Object::op_Implicit(obj)).unwrap_or(false)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_object_alive_safe(obj: *mut Il2CppObject) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    unsafe { Object::op_Implicit(obj) }
+}
+
+pub fn apply_translations(completed: &[(&String, &String)]) {
+    let tracker = ACTIVE_TEXT_COMPONENTS.lock().unwrap();
+    let gen = crate::core::sugoi_client::COMPONENT_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
+
+    #[cfg(target_os = "windows")]
     {
-        let mut tracker = ACTIVE_TEXT_COMPONENTS.lock().unwrap();
+        microseh::try_seh(|| {
+            for (&ptr, (entry_gen, saved_orig)) in tracker.iter() {
+                if *entry_gen != gen {
+                    continue;
+                }
+                let obj = ptr as *mut Il2CppObject;
+                if !is_object_alive_safe(obj) {
+                    continue;
+                }
+                let current_text = get_text(obj);
+                let still_matches = !current_text.is_null() && unsafe { (*current_text).as_utf16str().to_string() } == *saved_orig;
+                if still_matches {
+                    if let Some((_orig, trans)) = completed.iter().find(|(o, _)| **o == *saved_orig) {
+                        let unity_string = trans.to_il2cpp_string();
+                        get_orig_fn!(set_text_hook, SetTextFn)(obj, unity_string);
+                    }
+                }
+            }
+        }).ok();
+    }
 
-        tracker.retain(|&ptr, _| Object::op_Implicit(ptr as *mut Il2CppObject));
-
-        for (orig, trans) in completed {
-            let unity_string = trans.to_il2cpp_string();
-
-            for (&ptr, saved_orig) in tracker.iter() {
-                if saved_orig == orig {
-                    updates_to_apply.push((ptr, unity_string));
+    #[cfg(not(target_os = "windows"))]
+    {
+           for (&ptr, (entry_gen, saved_orig)) in tracker.iter() {
+                if *entry_gen != gen {
+                continue;
+            }
+            let obj = ptr as *mut Il2CppObject;
+            if !is_object_alive_safe(obj) {
+                continue;
+            }
+            let current_text = get_text(obj);
+            let still_matches = !current_text.is_null() && unsafe { (*current_text).as_utf16str().to_string() } == *saved_orig;
+            if still_matches {
+                if let Some((_orig, trans)) = completed.iter().find(|(o, _)| **o == *saved_orig) {
+                    let unity_string = trans.to_il2cpp_string();
+                    get_orig_fn!(set_text_hook, SetTextFn)(obj, unity_string);
                 }
             }
         }
     }
+}
 
-    for (ptr, unity_string) in updates_to_apply {
-        if Object::op_Implicit(ptr as *mut Il2CppObject) {
-            get_orig_fn!(set_text_hook, SetTextFn)(ptr as *mut Il2CppObject, unity_string);
-        }
-    }
+pub fn cleanup_components() {
+    ACTIVE_TEXT_COMPONENTS.lock().unwrap().clear();
 }
 
 pub fn init(UnityEngine_UI: *const Il2CppImage) {

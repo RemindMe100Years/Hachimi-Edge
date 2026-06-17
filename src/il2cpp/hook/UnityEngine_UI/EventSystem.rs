@@ -26,13 +26,29 @@ extern "C" fn Update(this: *mut Il2CppObject) {
 
     {
         let mut cache = crate::core::sugoi_client::TRANSLATION_CACHE.lock().unwrap();
-        for (orig, trans) in &completed {
+        for (_story_id, orig, trans) in &completed {
             cache.insert(orig.clone(), trans.clone());
         }
     }
 
-    crate::il2cpp::hook::UnityEngine_UI::Text::apply_translations(&completed);
-    crate::il2cpp::hook::UnityEngine_TextRenderingModule::TextMesh::apply_translations(&completed);
+    let active_story_id = crate::core::sugoi_client::ACTIVE_STORY_ID.load(std::sync::atomic::Ordering::Relaxed);
+    let mut applicable: Vec<(&String, &String)> = Vec::new();
+    for (story_id, orig, trans) in &completed {
+        if *story_id == 0 || *story_id == active_story_id {
+            applicable.push((orig, trans));
+        }
+    }
+
+    if applicable.is_empty() {
+        #[cfg(target_os = "windows")]
+        crate::windows::smtc::on_update();
+        return;
+    }
+
+    crate::il2cpp::hook::UnityEngine_UI::Text::apply_translations(&applicable);
+    crate::il2cpp::hook::UnityEngine_TextRenderingModule::TextMesh::apply_translations(&applicable);
+
+    crate::il2cpp::hook::umamusume::StoryTimelineData::apply_pending_clip_updates();
 
     #[cfg(target_os = "windows")]
     crate::windows::smtc::on_update();

@@ -73,6 +73,7 @@ pub extern "C" fn DllMain(hmodule: HMODULE, call_reason: c_ulong, _reserved: *mu
         info!("Attach completed");
     }
     else if call_reason == DLL_PROCESS_DETACH && Hachimi::is_initialized() {
+        crate::core::sugoi_client::SHUTDOWN.store(true, std::sync::atomic::Ordering::SeqCst);
         wnd_hook::uninit();
 
         info!("Unhooking everything");

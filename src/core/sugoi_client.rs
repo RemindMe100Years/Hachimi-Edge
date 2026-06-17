@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex, mpsc::{self, Receiver, Sender}};
+use std::sync::atomic::{AtomicU32, AtomicBool};
 
 use fnv::{FnvHashMap, FnvHashSet};
 use once_cell::sync::Lazy;
@@ -7,22 +8,18 @@ use serde::Serialize;
 use super::{Error, Hachimi};
 
 pub struct SugoiClient {
-    agent: ureq::Agent,
     url: String,
-    request_lock: Mutex<()>,
 }
 
 static INSTANCE: Lazy<Arc<SugoiClient>> = Lazy::new(|| {
     Arc::new(SugoiClient {
-        agent: ureq::Agent::new_with_defaults(),
         url: Hachimi::instance().config.load().sugoi_url.as_ref()
             .map(|s| s.clone())
             .unwrap_or_else(|| "http://127.0.0.1:14366".to_owned()),
-        request_lock: Mutex::new(()),
     })
 });
 
-pub static TRANSLATION_QUEUE: Lazy<(Sender<(String, String)>, Mutex<Receiver<(String, String)>>)> = Lazy::new(|| {
+pub static TRANSLATION_QUEUE: Lazy<(Sender<(u32, String, String)>, Mutex<Receiver<(u32, String, String)>>)> = Lazy::new(|| {
     let (tx, rx) = mpsc::channel();
     (tx, Mutex::new(rx))
 });
@@ -34,6 +31,17 @@ pub static TRANSLATION_CACHE: Lazy<Mutex<FnvHashMap<String, String>>> = Lazy::ne
 pub static PENDING_TRANSLATIONS: Lazy<Mutex<FnvHashSet<String>>> = Lazy::new(|| {
     Mutex::new(FnvHashSet::default())
 });
+
+pub static ACTIVE_STORY_ID: Lazy<AtomicU32> = Lazy::new(|| AtomicU32::new(0));
+pub static NEXT_STORY_ID: Lazy<AtomicU32> = Lazy::new(|| AtomicU32::new(1));
+pub static STORY_TL_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+pub static SHUTDOWN: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
+
+pub static PENDING_STORY_TRANSLATIONS: Lazy<Mutex<FnvHashMap<u32, FnvHashMap<String, Option<String>>>>> = Lazy::new(|| {
+    Mutex::new(FnvHashMap::default())
+});
+
+pub static COMPONENT_GENERATION: Lazy<AtomicU32> = Lazy::new(|| AtomicU32::new(1));
 
 pub static REQUEST_QUEUE: Lazy<Sender<String>> = Lazy::new(|| {
     let (tx, rx) = mpsc::channel::<String>();
@@ -59,7 +67,7 @@ pub static REQUEST_QUEUE: Lazy<Sender<String>> = Lazy::new(|| {
                     Ok(translated) => {
                         let mut pending = PENDING_TRANSLATIONS.lock().unwrap_or_else(|e| e.into_inner());
                         for (orig, trans) in batch.into_iter().zip(translated.into_iter()) {
-                            let _ = translation_tx.send((orig.clone(), trans));
+                            let _ = translation_tx.send((0, orig.clone(), trans));
                             pending.remove(&orig);
                         }
                     }
@@ -98,14 +106,14 @@ impl SugoiClient {
     }
 
     pub fn translate(&self, content: &[String]) -> Result<Vec<String>, Error> {
-        let _guard = self.request_lock.lock().unwrap();
+        let agent = ureq::Agent::new_with_defaults();
 
-        let res = self.agent.post(&self.url)
+        let res = agent.post(&self.url)
             .header("Content-Type", "application/json")
             .header("Connection", "close")
             .send_json(Message::TranslateSentences { content })?;
 
-        let body_str = res.into_body().read_to_string()?; 
+        let body_str = res.into_body().read_to_string()?;
         Ok(serde_json::from_str(&body_str)?)
     }
 
