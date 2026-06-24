@@ -606,7 +606,9 @@ impl GCHandle {
 
 impl Drop for GCHandle {
     fn drop(&mut self) {
-        il2cpp_gchandle_free(self.0);
+        if !crate::core::sugoi_client::SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            il2cpp_gchandle_free(self.0);
+        }
     }
 }
 

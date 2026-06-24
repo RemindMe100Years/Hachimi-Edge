@@ -1,16 +1,96 @@
 use std::ptr::null_mut;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use widestring::Utf16Str;
 
+use once_cell::sync::Lazy;
+
 use crate::{
-    core::{ext::Utf16StringExt, utils, Hachimi, SugoiClient}, 
+    core::{ext::Utf16StringExt, utils, Hachimi, SugoiClient},
     il2cpp::{
-        ext::{Il2CppStringExt, StringExt}, hook::{umamusume::{StoryTimelineCharaTrackData, StoryTimelineClipData}, UnityEngine_AssetBundleModule::AssetBundle::ASSET_PATH_PREFIX}, symbols::{get_field_from_name, get_field_object_value, get_field_value, set_field_object_value, set_field_value, IList}, types::*
+        ext::{Il2CppStringExt, StringExt}, hook::{umamusume::{StoryTimelineCharaTrackData, StoryTimelineClipData}, UnityEngine_AssetBundleModule::AssetBundle::ASSET_PATH_PREFIX}, symbols::{get_field_from_name, get_field_object_value, get_field_value, set_field_object_value, set_field_value, IList, GCHandle}, types::*
     }
 };
 
 use super::{StoryTimelineBlockData, StoryTimelineTextClipData, StoryTimelineTrackData};
+
+struct PendingClipUpdate {
+    story_handle: GCHandle,
+    story_id: u32,
+    dict: StoryTimelineDataDict,
+    wp: WrapParams,
+    no_wrap: bool,
+}
+
+static PENDING_CLIP_UPDATES: Lazy<Mutex<Vec<PendingClipUpdate>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+pub fn apply_pending_clip_updates() {
+    let updates = {
+        let mut queue = PENDING_CLIP_UPDATES.lock().unwrap();
+        std::mem::take(&mut *queue)
+    };
+
+    for update in updates {
+        let story_obj = update.story_handle.target();
+        if story_obj.is_null() {
+            continue;
+        }
+
+        if update.story_id != crate::core::sugoi_client::ACTIVE_STORY_ID.load(std::sync::atomic::Ordering::Relaxed) {
+            continue;
+        }
+
+        if let Some(block_list) = IList::new(get_BlockList(story_obj)) {
+            if let Some(title) = &update.dict.title {
+                let wrapped_title = apply_wrapping(title, &update.wp, update.no_wrap);
+                set_Title(story_obj, wrapped_title.to_il2cpp_string());
+            }
+
+            for (i, block_data) in block_list.iter().enumerate().skip(1) {
+                let Some(clip_data) = StoryTimelineBlockData::get_text_clip(block_data) else {
+                    continue;
+                };
+                let adjusted_i = i - 1;
+                let Some(block) = update.dict.text_block_list.get(adjusted_i) else {
+                    continue;
+                };
+
+                if let Some(name) = &block.name {
+                    let wrapped_name = apply_wrapping(name, &update.wp, update.no_wrap);
+                    StoryTimelineTextClipData::set_Name(clip_data, wrapped_name.to_il2cpp_string());
+                }
+
+                if let Some(text) = &block.text {
+                    let wrapped_text = apply_wrapping(text, &update.wp, update.no_wrap);
+                    StoryTimelineTextClipData::set_Text(clip_data, wrapped_text.to_il2cpp_string());
+                }
+
+                if let Some(choice_list) = IList::new(StoryTimelineTextClipData::get_ChoiceDataList(clip_data)) {
+                    for (j, choice_data) in choice_list.iter().enumerate() {
+                        if let Some(ct) = block.choice_data_list.get(j) {
+                            if !ct.is_empty() {
+                                let wrapped_choice = apply_wrapping(ct, &update.wp, update.no_wrap);
+                                StoryTimelineTextClipData::ChoiceData::set_Text(choice_data, wrapped_choice.to_il2cpp_string());
+                            }
+                        }
+                    }
+                }
+
+                if let Some(color_list) = IList::new(StoryTimelineTextClipData::get_ColorTextInfoList(clip_data)) {
+                    for (j, color_info) in color_list.iter().enumerate() {
+                        if let Some(ct) = block.color_text_info_list.get(j) {
+                            if !ct.is_empty() {
+                                let wrapped_color = apply_wrapping(ct, &update.wp, update.no_wrap);
+                                StoryTimelineTextClipData::ColorTextInfo::set_Text(color_info, wrapped_color.to_il2cpp_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 const CLIP_TEXT_LINE_WIDTH: i32 = 21;
 const CLIP_TEXT_LINE_COUNT: i32 = 3;
@@ -155,7 +235,25 @@ pub fn on_LoadAsset(_bundle: *mut Il2CppObject, this: *mut Il2CppObject, name: &
                 return None;
             }
 
-            dispatch_auto_tl_async(this, full_dict_path, wp.clone());
+            let guard = crate::core::sugoi_client::STORY_TL_LOCK.try_lock();
+            if guard.is_err() {
+                return None;
+            }
+
+            let story_id = crate::core::sugoi_client::NEXT_STORY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::core::sugoi_client::ACTIVE_STORY_ID.store(story_id, std::sync::atomic::Ordering::Relaxed);
+
+            {
+                let mut pending = crate::core::sugoi_client::PENDING_STORY_TRANSLATIONS.lock().unwrap();
+                pending.retain(|id, _| *id == story_id);
+            }
+
+            crate::core::sugoi_client::COMPONENT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::il2cpp::hook::UnityEngine_UI::Text::cleanup_components();
+            crate::il2cpp::hook::UnityEngine_TextRenderingModule::TextMesh::cleanup_components();
+
+            let story_handle = GCHandle::new(this, false);
+            dispatch_auto_tl_async(this, full_dict_path, wp.clone(), story_id, guard.unwrap(), story_handle);
             None
         }
         else {
@@ -395,15 +493,28 @@ struct WrapParams {
     size: i32,
 }
 
-fn dispatch_auto_tl_async(this: *mut Il2CppObject, full_dict_path: std::path::PathBuf, wp: WrapParams) {
+fn apply_wrapping(text: &str, wp: &WrapParams, no_wrap: bool) -> String {
+    if no_wrap {
+        return text.to_string();
+    }
+    if wp.is_story_view {
+        if let Some(wrapped) = utils::wrap_text(text, wp.story_view_line_width) {
+            return wrapped.join(" \n");
+        }
+    } else if wp.size == StoryTimelineTextClipData::FontSize_Default {
+        if let Some(fitted) = utils::wrap_fit_text(text, wp.line_width, wp.line_count, wp.font_size) {
+            return fitted;
+        }
+    }
+    text.to_string()
+}
+
+fn dispatch_auto_tl_async(this: *mut Il2CppObject, full_dict_path: std::path::PathBuf, wp: WrapParams, story_id: u32, _lock_guard: std::sync::MutexGuard<'static, ()>, story_handle: GCHandle) {
     let Some(block_list) = <IList>::new(get_BlockList(this)) else {
         return;
     };
 
     let mut dict = StoryTimelineDataDict::default();
-
-    // Step 1: Prepare the tl batch and prepopulate the dict with Some()
-    // so we know which ones to fill in later
 
     let title = get_Title(this);
     if !title.is_null() && unsafe { (*title).length > 0 } {
@@ -462,7 +573,6 @@ fn dispatch_auto_tl_async(this: *mut Il2CppObject, full_dict_path: std::path::Pa
         dict.text_block_list.push(block_dict);
     }
 
-    // Step 2: Send it to the tl server
     std::thread::spawn(move || {
         let sugoi = SugoiClient::instance();
         let tx = crate::core::sugoi_client::TRANSLATION_QUEUE.0.clone();
@@ -496,70 +606,160 @@ fn dispatch_auto_tl_async(this: *mut Il2CppObject, full_dict_path: std::path::Pa
             text.to_string()
         };
 
+        let mut tl_batch: Vec<String> = Vec::new();
+        let mut names_tmp: Vec<String> = Vec::new();
+        let mut name_indices: fnv::FnvHashMap<String, usize> = fnv::FnvHashMap::default();
+
+        let title = &dict.title;
+        if let Some(t) = title {
+            if !t.is_empty() {
+                tl_batch.push(t.clone());
+            }
+        }
+
+        for block in &dict.text_block_list {
+            if let Some(name) = &block.name {
+                if !name.is_empty() {
+                    if !name_indices.contains_key(name) {
+                        name_indices.insert(name.clone(), names_tmp.len());
+                        names_tmp.push(name.clone());
+                    }
+                }
+            }
+
+            if let Some(text) = &block.text {
+                tl_batch.push(text.clone());
+            }
+
+            for choice in &block.choice_data_list {
+                tl_batch.push(choice.clone());
+            }
+
+            for color_text in &block.color_text_info_list {
+                tl_batch.push(color_text.clone());
+            }
+        }
+
+        let names_count = names_tmp.len();
+        tl_batch.append(&mut names_tmp);
+
+        {
+            let mut pending = crate::core::sugoi_client::PENDING_STORY_TRANSLATIONS.lock().unwrap();
+            let story_pending = pending.entry(story_id).or_insert_with(fnv::FnvHashMap::default);
+            for text in &tl_batch {
+                if !text.is_empty() {
+                    story_pending.entry(text.clone()).or_insert(None);
+                }
+            }
+        }
+
+        let translations = if tl_batch.is_empty() {
+            Vec::new()
+        } else {
+            match sugoi.translate(&tl_batch) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("Batch translation failed: {}", e);
+                    return;
+                }
+            }
+        };
+
+        let mut translated = translations;
+        let translated_names = if names_count > 0 {
+            translated.split_off(translated.len() - names_count)
+        } else {
+            Vec::new()
+        };
+
+        let mut name_trans_map: fnv::FnvHashMap<String, String> = fnv::FnvHashMap::default();
+        for (idx, trans) in translated_names.iter().enumerate() {
+            for (name, &i) in name_indices.iter() {
+                if i == idx {
+                    name_trans_map.insert(name.clone(), trans.clone());
+                    break;
+                }
+            }
+        }
+
+        let mut tl_iter = translated.into_iter();
         let mut updates_made = 0;
 
         if let Some(title) = &mut dict.title {
             if !title.is_empty() {
-                let trans = sugoi.get_cached(title).or_else(|| sugoi.translate_one(title.clone()).ok());
-                if let Some(t) = trans {
-                    let _ = tx.send((title.clone(), t.clone()));
+                if let Some(t) = tl_iter.next() {
+                    {
+                        let mut pending = crate::core::sugoi_client::PENDING_STORY_TRANSLATIONS.lock().unwrap();
+                        if let Some(story_pending) = pending.get_mut(&story_id) {
+                            story_pending.insert(title.clone(), Some(t.clone()));
+                        }
+                    }
+                    let _ = tx.send((story_id, title.clone(), t.clone()));
                     *title = t;
                     updates_made += 1;
                 }
             }
         }
 
-        let block_count = dict.text_block_list.len();
-        for i in 0..block_count {
-            {
-                let block = &mut dict.text_block_list[i];
+        for i in 0..dict.text_block_list.len() {
+            let block = &mut dict.text_block_list[i];
 
-                if let Some(name) = &mut block.name {
-                    if !name.is_empty() {
-                        let trans = sugoi.get_cached(name).or_else(|| sugoi.translate_one(name.clone()).ok());
-                        if let Some(t) = trans {
-                            let _ = tx.send((name.clone(), t.clone()));
-                            *name = t;
-                            updates_made += 1;
+            if let Some(name) = &block.name {
+                if let Some(translated_name) = name_trans_map.get(name) {
+                    {
+                        let mut pending = crate::core::sugoi_client::PENDING_STORY_TRANSLATIONS.lock().unwrap();
+                        if let Some(story_pending) = pending.get_mut(&story_id) {
+                            story_pending.insert(name.clone(), Some(translated_name.clone()));
                         }
                     }
+                    let _ = tx.send((story_id, name.clone(), translated_name.clone()));
+                    block.name = Some(translated_name.clone());
+                    updates_made += 1;
                 }
+            }
 
-                if let Some(text) = &mut block.text {
-                    if !text.is_empty() {
-                        let trans = sugoi.get_cached(text).or_else(|| sugoi.translate_one(text.clone()).ok());
-                        if let Some(t) = trans {
-                            let final_t = process_wrap(&t, true);
-                            let _ = tx.send((text.clone(), final_t));
-                            *text = t;
-
-                            updates_made += 1;
+            if let Some(text) = &mut block.text {
+                if let Some(t) = tl_iter.next() {
+                    let final_t = process_wrap(&t, true);
+                    {
+                        let mut pending = crate::core::sugoi_client::PENDING_STORY_TRANSLATIONS.lock().unwrap();
+                        if let Some(story_pending) = pending.get_mut(&story_id) {
+                            story_pending.insert(text.clone(), Some(final_t.clone()));
                         }
                     }
+                    let _ = tx.send((story_id, text.clone(), final_t));
+                    *text = t;
+                    updates_made += 1;
                 }
+            }
 
-                for choice in block.choice_data_list.iter_mut() {
-                    if !choice.is_empty() {
-                        let trans = sugoi.get_cached(choice).or_else(|| sugoi.translate_one(choice.clone()).ok());
-                        if let Some(t) = trans {
-                            let final_t = process_wrap(&t, false);
-                            let _ = tx.send((choice.clone(), final_t));
-                            *choice = t;
-                            updates_made += 1;
+            for choice in block.choice_data_list.iter_mut() {
+                if let Some(t) = tl_iter.next() {
+                    let final_t = process_wrap(&t, true);
+                    {
+                        let mut pending = crate::core::sugoi_client::PENDING_STORY_TRANSLATIONS.lock().unwrap();
+                        if let Some(story_pending) = pending.get_mut(&story_id) {
+                            story_pending.insert(choice.clone(), Some(final_t.clone()));
                         }
                     }
+                    let _ = tx.send((story_id, choice.clone(), final_t));
+                    *choice = t;
+                    updates_made += 1;
                 }
+            }
 
-                for color_text in block.color_text_info_list.iter_mut() {
-                    if !color_text.is_empty() {
-                        let trans = sugoi.get_cached(color_text).or_else(|| sugoi.translate_one(color_text.clone()).ok());
-                        if let Some(t) = trans {
-                            let final_t = process_wrap(&t, false);
-                            let _ = tx.send((color_text.clone(), final_t));
-                            *color_text = t;
-                            updates_made += 1;
+            for color_text in block.color_text_info_list.iter_mut() {
+                if let Some(t) = tl_iter.next() {
+                    let final_t = process_wrap(&t, false);
+                    {
+                        let mut pending = crate::core::sugoi_client::PENDING_STORY_TRANSLATIONS.lock().unwrap();
+                        if let Some(story_pending) = pending.get_mut(&story_id) {
+                            story_pending.insert(color_text.clone(), Some(final_t.clone()));
                         }
                     }
+                    let _ = tx.send((story_id, color_text.clone(), final_t));
+                    *color_text = t;
+                    updates_made += 1;
                 }
             }
 
@@ -567,6 +767,21 @@ fn dispatch_auto_tl_async(this: *mut Il2CppObject, full_dict_path: std::path::Pa
                 save_dict(&dict);
                 updates_made = 0;
             }
+        }
+
+        let no_wrap = dict.no_wrap;
+        {
+            let mut queue = PENDING_CLIP_UPDATES.lock().unwrap();
+            queue.push(PendingClipUpdate {
+                story_handle,
+                story_id,
+                dict,
+                wp,
+                no_wrap,
+            });
+        }
+        if !crate::core::sugoi_client::SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            // Clip updates will be applied by EventSystem::Update on main thread
         }
     });
 }

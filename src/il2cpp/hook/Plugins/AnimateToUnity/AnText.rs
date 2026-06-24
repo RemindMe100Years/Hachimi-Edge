@@ -1,5 +1,5 @@
 use crate::{
-    core::{template, Hachimi},
+    core::{sugoi_client::SugoiClient, template, Hachimi},
     il2cpp::{
         ext::{Il2CppStringExt, StringExt},
         hook::UnityEngine_TextRenderingModule::TextAnchor,
@@ -32,7 +32,26 @@ impl_addr_wrapper_fn!(SetTextFontSize, SET_TEXT_FONTSIZE_ADDR, (), this: *mut Il
 
 type SetTextFn = extern "C" fn(this: *mut Il2CppObject, text: *mut Il2CppString);
 extern "C" fn SetText(this: *mut Il2CppObject, mut text: *mut Il2CppString) {
+    if text.is_null() {
+        return get_orig_fn!(SetText, SetTextFn)(this, text);
+    }
+
     let text_utf = unsafe { (*text).as_utf16str() };
+    let orig_str = text_utf.to_string();
+
+    // Check translation cache first — catches choices and other AnText on 1st view
+    if let Some(trans) = SugoiClient::instance().get_cached(&orig_str) {
+        return get_orig_fn!(SetText, SetTextFn)(this, trans.to_il2cpp_string());
+    }
+
+    // Check pending story translations — catches choices before they hit the cache
+    let active_id = crate::core::sugoi_client::ACTIVE_STORY_ID.load(std::sync::atomic::Ordering::Relaxed);
+    if let Some(story_pending) = crate::core::sugoi_client::PENDING_STORY_TRANSLATIONS.lock().unwrap().get(&active_id) {
+        if let Some(Some(trans)) = story_pending.get(&orig_str) {
+            return get_orig_fn!(SetText, SetTextFn)(this, trans.to_il2cpp_string());
+        }
+    }
+
     if !text_utf.as_slice().contains(&36) { // 36 = dollar sign ($)
         return get_orig_fn!(SetText, SetTextFn)(this, text);
     }
@@ -64,6 +83,7 @@ struct TemplateContext {
 
 impl template::Context for TemplateContext {
     fn on_filter_eval(&mut self, name: &str, args: &[template::Token]) -> Option<String> {
+        debug!("Eval filter");
         match name {
             "anchor" => {
                 let value = args.get(0)?;
@@ -76,14 +96,19 @@ impl template::Context for TemplateContext {
             }
 
             "scale" => {
+                debug!("Eval scale");
                 let value = args.get(0)?;
                 let template::Token::NumberLit(percentage) = value else {
                     return None;
                 };
                 let cur_size = get_fontSize(self.component);
+                debug!("Cur size: {cur_size}");
                 let new_size = (cur_size as f64 * (percentage / 100.0)) as i32;
+                debug!("Setting scale");
                 SetTextFontSize(self.component, new_size);
+                debug!("Setting fit");
                 SetTextFit(self.component, false);
+                debug!("all set");
             }
 
             "ls" => {
